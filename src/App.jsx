@@ -215,23 +215,22 @@ const diagnoseCircuit = (comps, wires) => {
   if (!hasGnd && hasSrc) issues.push({ type: "warn", msg: "No ground reference. Add GND for proper simulation.", icon: "⏚", fix: "Add Ground from Power category and wire it to the negative terminal." });
   if (hasSrc && !hasLoad) issues.push({ type: "warn", msg: "No load component. Add a resistor, LED, or motor.", icon: "💡", fix: "Add a Resistor or LED to create a current path." });
 
-  // Check for unconnected components
+  // Check for unconnected components (use 25px tolerance to match sim engine)
+  const DT = 25;
   comps.forEach(c => {
     const pins = pinPos(c);
     const connectedPins = pins.filter(pin =>
-      wires.some(w => Math.hypot(w.x1 - pin.x, w.y1 - pin.y) < 18 || Math.hypot(w.x2 - pin.x, w.y2 - pin.y) < 18)
+      wires.some(w => Math.hypot(w.x1 - pin.x, w.y1 - pin.y) < DT || Math.hypot(w.x2 - pin.x, w.y2 - pin.y) < DT)
     );
     if (connectedPins.length === 0 && c.type !== "gnd" && c.type !== "vcc" && c.type !== "vdd") {
-      issues.push({ type: "warn", msg: `${c.label} (${c.type.replace(/_/g, " ")}) has no wires connected.`, icon: "🔌", fix: `Use Wire tool (W) to connect ${c.label} to other components.` });
-    } else if (connectedPins.length < 2 && pins.length >= 2) {
-      issues.push({ type: "warn", msg: `${c.label} only has ${connectedPins.length}/${pins.length} pins connected.`, icon: "⚠️", fix: `Connect remaining pins of ${c.label} to complete the circuit.` });
+      issues.push({ type: "warn", msg: `${c.label} has no wires connected.`, icon: "🔌", fix: `Use Wire tool (W) to connect ${c.label}.` });
     }
   });
 
-  // Check for open/closed switches
+  // Check for open switches
   comps.forEach(c => {
     if (["switch_spst", "switch_spdt", "push_btn"].includes(c.type) && !c.switchState) {
-      issues.push({ type: "info", msg: `${c.label} is OPEN — no current flows through it.`, icon: "🔓", fix: "Click the switch or toggle it in Properties to close it." });
+      issues.push({ type: "info", msg: `${c.label} is OPEN — blocks current flow.`, icon: "🔓", fix: "Click switch to close it." });
     }
   });
 
@@ -241,42 +240,114 @@ const diagnoseCircuit = (comps, wires) => {
       const totalV = comps.reduce((s, cc) => s + (["vdc", "vac"].includes(cc.type) || cc.type.startsWith("battery") ? cc.value : 0), 0);
       const totalR = comps.reduce((s, cc) => s + (cc.type === "resistor" ? cc.value : 0), 0) || 1000;
       if (totalV / totalR > c.value) {
-        issues.push({ type: "error", msg: `${c.label} BLOWN! Circuit current ${(totalV / totalR).toFixed(3)}A exceeds ${c.value}A rating.`, icon: "💥", fix: `Increase fuse rating or add more resistance.` });
+        issues.push({ type: "error", msg: `${c.label} BLOWN! ${(totalV / totalR).toFixed(3)}A > ${c.value}A`, icon: "💥", fix: `Increase fuse rating or add resistance.` });
       }
     }
   });
 
-  // Check path continuity
-  if (hasSrc && hasLoad && wires.length > 0) {
+  // Check path continuity using flood fill with wider tolerance
+  if (hasSrc && wires.length > 0) {
     const srcComp = comps.find(c => ["vdc", "vac", "idc"].includes(c.type) || c.type.startsWith("battery"));
     if (srcComp) {
       const srcPins = pinPos(srcComp);
-      const connected = new Set();
+      const visited = new Set();
       const visit = (px, py) => {
         const key = `${Math.round(px)},${Math.round(py)}`;
-        if (connected.has(key)) return;
-        connected.add(key);
+        if (visited.has(key)) return;
+        visited.add(key);
+        // Follow wires
         wires.forEach(w => {
-          if (Math.hypot(w.x1 - px, w.y1 - py) < 18) visit(w.x2, w.y2);
-          if (Math.hypot(w.x2 - px, w.y2 - py) < 18) visit(w.x1, w.y1);
+          if (Math.hypot(w.x1 - px, w.y1 - py) < DT) visit(w.x2, w.y2);
+          if (Math.hypot(w.x2 - px, w.y2 - py) < DT) visit(w.x1, w.y1);
+        });
+        // Follow through component pins (if not an open switch)
+        comps.forEach(cc => {
+          const isSw = ["switch_spst", "switch_spdt", "push_btn"].includes(cc.type);
+          if (isSw && !cc.switchState) return; // open switch blocks
+          const cPins = pinPos(cc);
+          const touchesMe = cPins.some(cp => Math.hypot(cp.x - px, cp.y - py) < DT);
+          if (touchesMe) {
+            cPins.forEach(cp => visit(cp.x, cp.y));
+          }
         });
       };
       if (srcPins[0]) visit(srcPins[0].x, srcPins[0].y);
-      const srcPin2Connected = srcPins[1] && connected.has(`${Math.round(srcPins[1].x)},${Math.round(srcPins[1].y)}`);
-      if (!srcPin2Connected && srcPins.length >= 2) {
-        issues.push({ type: "error", msg: "Circuit is OPEN — no complete loop back to the source.", icon: "🔄", fix: "Ensure wires form a complete loop from + terminal through components back to − terminal." });
+      const pin2Reached = srcPins[1] && visited.has(`${Math.round(srcPins[1].x)},${Math.round(srcPins[1].y)}`);
+      if (!pin2Reached && srcPins.length >= 2) {
+        issues.push({ type: "error", msg: "Circuit OPEN — no complete loop back to source.", icon: "🔄", fix: "Wire from + terminal through components back to − terminal." });
       }
     }
   }
 
   if (issues.length === 0 && comps.length > 0) {
-    if (hasSrc && hasLoad && wires.length > 0) issues.push({ type: "ok", msg: "Circuit looks good! Hit RUN to simulate.", icon: "✅" });
+    if (hasSrc && hasLoad && wires.length > 0) issues.push({ type: "ok", msg: "Circuit looks good! Hit ▶ RUN to simulate.", icon: "✅" });
     else issues.push({ type: "info", msg: "Keep building — add more components and wires.", icon: "🔨" });
   }
   return issues;
 };
 
-// ═══ SIMULATION ENGINE ══════════════════════════════════════════════════════
+// ═══ SIMULATION ENGINE (Node-Based Circuit Tracer) ══════════════════════════
+const CONN_TOL = 25; // Connection tolerance in pixels — generous for snapped pins
+const isNear = (x1, y1, x2, y2) => Math.hypot(x1 - x2, y1 - y2) < CONN_TOL;
+
+// Build a connectivity graph: which points are electrically connected?
+const buildNetGraph = (comps, wires) => {
+  // Union-Find for grouping connected nodes
+  const parent = {};
+  const find = (k) => { if (parent[k] === undefined) parent[k] = k; return parent[k] === k ? k : (parent[k] = find(parent[k])); };
+  const union = (a, b) => { parent[find(a)] = find(b); };
+  const key = (x, y) => `${Math.round(x)},${Math.round(y)}`;
+
+  // Register all pin positions
+  const pinMap = []; // {key, compId, pinIdx, x, y}
+  comps.forEach(c => {
+    const pins = pinPos(c);
+    pins.forEach((p, i) => {
+      const k = key(p.x, p.y);
+      pinMap.push({ key: k, compId: c.id, pinIdx: i, x: p.x, y: p.y });
+      find(k); // ensure node exists
+    });
+    // Internal connections: for most 2-pin components, pin0 and pin1 conduct through
+    // For switches, only conduct if closed
+    const isSw = ["switch_spst", "switch_spdt", "push_btn"].includes(c.type);
+    if (isSw && c.switchState && pins.length >= 2) {
+      union(key(pins[0].x, pins[0].y), key(pins[1].x, pins[1].y));
+    } else if (!isSw && pins.length >= 2) {
+      // All non-switch components conduct between all their pins
+      for (let i = 1; i < pins.length; i++) {
+        union(key(pins[0].x, pins[0].y), key(pins[i].x, pins[i].y));
+      }
+    }
+  });
+
+  // Connect wire endpoints to each other
+  wires.forEach(w => {
+    const k1 = key(w.x1, w.y1), k2 = key(w.x2, w.y2);
+    find(k1); find(k2);
+    union(k1, k2);
+  });
+
+  // Connect wire endpoints to nearby pins (tolerance-based)
+  wires.forEach(w => {
+    pinMap.forEach(pm => {
+      if (isNear(w.x1, w.y1, pm.x, pm.y)) union(key(w.x1, w.y1), pm.key);
+      if (isNear(w.x2, w.y2, pm.x, pm.y)) union(key(w.x2, w.y2), pm.key);
+    });
+  });
+
+  // Also connect wire endpoints that are near each other (junctions)
+  for (let i = 0; i < wires.length; i++) {
+    for (let j = i + 1; j < wires.length; j++) {
+      if (isNear(wires[i].x1, wires[i].y1, wires[j].x1, wires[j].y1)) union(key(wires[i].x1, wires[i].y1), key(wires[j].x1, wires[j].y1));
+      if (isNear(wires[i].x1, wires[i].y1, wires[j].x2, wires[j].y2)) union(key(wires[i].x1, wires[i].y1), key(wires[j].x2, wires[j].y2));
+      if (isNear(wires[i].x2, wires[i].y2, wires[j].x1, wires[j].y1)) union(key(wires[i].x2, wires[i].y2), key(wires[j].x1, wires[j].y1));
+      if (isNear(wires[i].x2, wires[i].y2, wires[j].x2, wires[j].y2)) union(key(wires[i].x2, wires[i].y2), key(wires[j].x2, wires[j].y2));
+    }
+  }
+
+  return { find, key, pinMap };
+};
+
 const simulate = (comps, wires) => {
   const R = {};
   let V = 0, Rtot = 0, Ctot = 0, Ltot = 0, hasSrc = false, hasAC = false;
@@ -293,28 +364,56 @@ const simulate = (comps, wires) => {
   const P = V * I;
   const t = Date.now() / 1000;
 
-  // Check for open switches breaking the circuit
-  const hasOpenSwitch = comps.some(c => ["switch_spst", "switch_spdt", "push_btn"].includes(c.type) && !c.switchState &&
-    wires.some(w => { const ps = pinPos(c); return ps.some(p => Math.hypot(w.x1 - p.x, w.y1 - p.y) < 18 || Math.hypot(w.x2 - p.x, w.y2 - p.y) < 18); }));
-  const effectiveI = hasOpenSwitch ? 0 : I;
-  const effectiveV = hasOpenSwitch ? 0 : V;
+  // Build connectivity graph
+  const net = buildNetGraph(comps, wires);
+
+  // Check if source forms a complete loop (pin0 connected to pin1 through the network)
+  let circuitClosed = false;
+  const srcComp = comps.find(c => ["vdc", "vac", "idc", "iac", "solar_cell"].includes(c.type) || c.type.startsWith("battery"));
+  if (srcComp) {
+    const srcPins = pinPos(srcComp);
+    if (srcPins.length >= 2) {
+      const net1 = net.find(net.key(Math.round(srcPins[0].x), Math.round(srcPins[0].y)));
+      const net2 = net.find(net.key(Math.round(srcPins[1].x), Math.round(srcPins[1].y)));
+      circuitClosed = net1 === net2;
+    }
+  }
+
+  const effectiveI = circuitClosed ? I : 0;
+  const effectiveV = circuitClosed ? V : 0;
 
   comps.forEach(c => {
     const s = { voltage: 0, current: 0, power: 0, active: false, brightness: 0, reading: null, flowing: false, whyNotFlowing: null };
     const pins = pinPos(c);
-    const connPins = pins.filter(pin => wires.some(w => Math.hypot(w.x1 - pin.x, w.y1 - pin.y) < 18 || Math.hypot(w.x2 - pin.x, w.y2 - pin.y) < 18));
+
+    // Check how many pins are connected to the source network
+    const connPins = pins.filter(pin =>
+      wires.some(w => isNear(w.x1, w.y1, pin.x, pin.y) || isNear(w.x2, w.y2, pin.x, pin.y))
+    );
     const conn = connPins.length > 0;
-    const fullyConn = connPins.length >= Math.min(2, pins.length);
-    const isConn = conn && hasSrc && fullyConn;
 
-    // Determine why not flowing
+    // Check if this component is on the active circuit path (same net as source)
+    let onCircuit = false;
+    if (srcComp) {
+      const srcPins = pinPos(srcComp);
+      if (srcPins[0]) {
+        const srcNet = net.find(net.key(Math.round(srcPins[0].x), Math.round(srcPins[0].y)));
+        onCircuit = pins.some(pin => net.find(net.key(Math.round(pin.x), Math.round(pin.y))) === srcNet);
+      }
+    }
+
+    // Determine flow status & reason
     if (!hasSrc) s.whyNotFlowing = "No power source in circuit";
-    else if (!conn) s.whyNotFlowing = "Component not wired to circuit";
-    else if (!fullyConn) s.whyNotFlowing = `Only ${connPins.length}/${pins.length} pins connected`;
-    else if (hasOpenSwitch) s.whyNotFlowing = "Open switch breaking circuit path";
-    else if (V === 0) s.whyNotFlowing = "Source voltage is 0V";
+    else if (!conn) s.whyNotFlowing = "Not wired to circuit";
+    else if (!onCircuit) s.whyNotFlowing = "Not connected to power source network";
+    else if (!circuitClosed) {
+      // Find specific reason
+      const openSw = comps.find(cc => ["switch_spst", "switch_spdt", "push_btn"].includes(cc.type) && !cc.switchState && conn);
+      if (openSw) s.whyNotFlowing = `${openSw.label} is OPEN — breaking circuit`;
+      else s.whyNotFlowing = "Circuit loop not complete — wire both terminals of source";
+    } else if (V === 0) s.whyNotFlowing = "Source voltage is 0V";
 
-    s.flowing = isConn && effectiveI > 0 && !hasOpenSwitch;
+    s.flowing = hasSrc && onCircuit && circuitClosed && effectiveI > 0;
 
     // Passive
     if (["resistor", "rheostat", "thermistor", "ldr", "potentiometer", "fuse"].includes(c.type)) {
